@@ -15,6 +15,14 @@ import numpy as np
 
 from pytorch_mnist import (
     Net,
+    CNNNet,
+    create_model,
+    MODEL_TYPES,
+    detect_model_type,
+    MODEL_DIR,
+    MODEL_FILES,
+    ensure_model_dir,
+    get_default_model_path,
     get_data_loader,
     evaluate,
     save_model,
@@ -59,9 +67,13 @@ class MNISTApp:
         master.title("MNIST 手写数字识别系统")
         master.resizable(False, False)
 
+        # ---------- 确保模型目录 ----------
+        ensure_model_dir()
+
         # ---------- 模型 ----------
-        self.net = Net()
-        self.model_path = os.path.join(os.path.dirname(__file__), "model.pth")
+        self.model_type = "FNN"  # 默认模型类型
+        self.net = create_model(self.model_type)
+        self.model_path = get_default_model_path(self.model_type)
         self.model_loaded = self._try_load_model()
 
         # ---------- 训练状态 ----------
@@ -128,6 +140,20 @@ class MNISTApp:
         ttk.Spinbox(row2, from_=0.0001, to=0.1, increment=0.0001,
                     textvariable=self.lr_var, width=8).pack(side=tk.LEFT, padx=5)
 
+        # 模型类型选择
+        row3 = ttk.Frame(param_box)
+        row3.pack(fill=tk.X, pady=2)
+        ttk.Label(row3, text="模型类型:", width=14).pack(side=tk.LEFT)
+        self.model_type_var = tk.StringVar(value="FNN")
+        model_type_combo = ttk.Combobox(
+            row3, textvariable=self.model_type_var,
+            values=["FNN (全连接网络)", "CNN (卷积网络)"],
+            state="readonly", width=20
+        )
+        model_type_combo.pack(side=tk.LEFT, padx=5)
+        model_type_combo.bind("<<ComboboxSelected>>", self._on_model_type_changed)
+        ttk.Label(row3, text="  CNN准确率更高，训练稍慢", foreground="gray").pack(side=tk.LEFT)
+
         # --- 操作按钮 ---
         btn_box = ttk.Frame(frame)
         btn_box.pack(fill=tk.X, pady=5)
@@ -186,21 +212,25 @@ class MNISTApp:
             return
 
         # 重置模型参数（使用新模型开始训练）
-        self.train_net = Net()
+        selected = self.model_type_var.get()
+        model_type = "CNN" if "CNN" in selected else "FNN"
+        self.model_type = model_type
+        self.train_net = create_model(model_type)
         epochs = self.epochs_var.get()
         lr = self.lr_var.get()
 
         # 在线程中执行训练
         def train_thread():
             # 训练前评估
-            init_acc = evaluate(self.test_data, self.train_net)
+            init_acc = evaluate(self.test_data, self.train_net, model_type=model_type)
             self._append_log(f"[*] 初始准确率: {init_acc:.2%}\n")
-            self._append_log(f"[*] 开始训练: epochs={epochs}, batch={self.batch_var.get()}, lr={lr}\n\n")
+            self._append_log(f"[*] 开始训练: epochs={epochs}, batch={self.batch_var.get()}, lr={lr}, model={model_type}\n\n")
 
             logs = train_model(
                 self.train_net, self.train_data, self.test_data,
                 epochs=epochs, lr=lr,
                 callback=self._on_epoch_end,
+                model_type=model_type,
             )
 
             if self.training:  # 没有被停止
@@ -237,7 +267,10 @@ class MNISTApp:
 
         # 将训练好的模型设为主模型
         self.net.load_state_dict(self.train_net.state_dict())
+        self.model_path = get_default_model_path(self.model_type)
         self.model_loaded = True
+        # 同步模型类型下拉框
+        self.model_type_var.set("CNN (卷积网络)" if self.model_type == "CNN" else "FNN (全连接网络)")
         self._update_model_status()
 
     def _stop_training(self):
@@ -249,10 +282,29 @@ class MNISTApp:
         self.status_label.config(text="训练已停止")
         self._append_log("\n[!] 训练已手动停止\n")
 
+    def _on_model_type_changed(self, event=None):
+        """模型类型切换时的处理"""
+        selected = self.model_type_var.get()
+        new_type = "CNN" if "CNN" in selected else "FNN"
+        if new_type != self.model_type:
+            if messagebox.askyesno("切换模型类型",
+                                   f"切换将重置当前模型为新的{new_type}模型，是否继续？"):
+                self.model_type = new_type
+                self.net = create_model(self.model_type)
+                self.model_path = get_default_model_path(self.model_type)
+                self.model_loaded = False
+                self._update_model_status()
+                self.status_label.config(text=f"已切换至{new_type}模型")
+            else:
+                # 恢复选择
+                old_label = "CNN (卷积网络)" if self.model_type == "CNN" else "FNN (全连接网络)"
+                self.model_type_var.set(old_label)
+
     def _reset_model(self):
         """重置模型为未训练状态"""
         if messagebox.askyesno("确认", "确定要重置模型为未训练的初始状态吗？"):
-            self.net = Net()
+            self.net = create_model(self.model_type)
+            self.model_path = get_default_model_path(self.model_type)
             self.model_loaded = False
             self._update_model_status()
             self.status_label.config(text="模型已重置")
@@ -376,10 +428,16 @@ class MNISTApp:
             return
 
         img_small = self.image.resize((28, 28), Image.LANCZOS)
-        arr = np.array(img_small, dtype=np.float32)
+        arr = np.array(img_small, dtype=np.float32) / 255.0
 
         with torch.no_grad():
-            tensor = torch.tensor(arr, dtype=torch.float32).view(-1, 28 * 28) / 255.0
+            self.net.eval()
+            if self.model_type == "CNN":
+                # CNN: 输入形状 (1, 1, 28, 28)
+                tensor = torch.tensor(arr, dtype=torch.float32).view(1, 1, 28, 28)
+            else:
+                # FNN: 输入形状 (1, 784)
+                tensor = torch.tensor(arr, dtype=torch.float32).view(1, 28 * 28)
             output = self.net.forward(tensor)
             probs = F.softmax(output, dim=1).squeeze(0).numpy()
             pred = int(torch.argmax(output, dim=1).item())
@@ -414,7 +472,7 @@ class MNISTApp:
         btn_row1.pack(fill=tk.X, pady=2)
         ttk.Button(btn_row1, text="保存模型", command=self._save_model_ui).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_row1, text="加载模型", command=self._load_model_ui).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_row1, text="加载默认模型 (model.pth)", command=self._load_default_model).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row1, text="加载默认模型", command=self._load_default_model).pack(side=tk.LEFT, padx=5)
 
         # --- 查看参数 ---
         param_box = ttk.LabelFrame(frame, text="模型参数", padding=10)
@@ -431,19 +489,22 @@ class MNISTApp:
 
     def _update_model_status(self):
         """更新模型状态显示"""
+        model_label = {"FNN": "全连接网络(FNN)", "CNN": "卷积网络(CNN)"}.get(self.model_type, self.model_type)
         if self.model_loaded:
-            self.model_status_var.set(f"✅ 模型已加载 ({self.model_path})")
+            self.model_status_var.set(f"✅ {model_label} 已加载 ({self.model_path})")
             self.status_label.config(text="模型就绪")
         else:
-            self.model_status_var.set("❌ 未加载模型（请训练或加载模型）")
+            self.model_status_var.set(f"❌ {model_label} 未加载（请训练或加载模型）")
             self.status_label.config(text="模型未加载")
 
     def _save_model_ui(self):
         """UI 保存模型"""
+        default_name = MODEL_FILES.get(self.model_type, "fnn_model.pth")
         filepath = filedialog.asksaveasfilename(
             defaultextension=".pth",
             filetypes=[("PyTorch 模型", "*.pth"), ("所有文件", "*.*")],
-            initialfile="model.pth",
+            initialdir=MODEL_DIR,
+            initialfile=default_name,
             title="保存模型",
         )
         if filepath:
@@ -459,30 +520,49 @@ class MNISTApp:
         )
         if filepath:
             try:
-                new_net = Net()
-                load_model(new_net, filepath)
+                # 检测模型类型
+                state_dict = torch.load(filepath, map_location="cpu")
+                model_type = detect_model_type(state_dict)
+                new_net = create_model(model_type)
+                new_net.load_state_dict(state_dict)
                 self.net = new_net
+                self.model_type = model_type
                 self.model_path = filepath
                 self.model_loaded = True
+                # 同步下拉框
+                self.model_type_var.set("CNN (卷积网络)" if model_type == "CNN" else "FNN (全连接网络)")
                 self._update_model_status()
-                messagebox.showinfo("成功", f"模型已从 {filepath} 加载")
+                messagebox.showinfo("成功", f"已加载 {model_type} 模型:\n{filepath}")
             except Exception as e:
                 messagebox.showerror("错误", f"加载失败: {e}")
 
     def _load_default_model(self):
-        """加载默认 model.pth"""
-        path = os.path.join(os.path.dirname(__file__), "model.pth")
+        """加载当前模型类型的默认模型（位于 model/ 目录）"""
+        path = get_default_model_path(self.model_type)
         if not os.path.exists(path):
-            messagebox.showwarning("警告", f"默认模型文件不存在: {path}\n请先在「训练」选项卡中训练。")
-            return
+            # 尝试加载另一个类型的模型作为备选
+            alt_type = "CNN" if self.model_type == "FNN" else "FNN"
+            alt_path = get_default_model_path(alt_type)
+            if os.path.exists(alt_path):
+                path = alt_path
+                # 临时更新类型
+                self.model_type = alt_type
+                self.model_type_var.set("CNN (卷积网络)" if alt_type == "CNN" else "FNN (全连接网络)")
+            else:
+                messagebox.showwarning("警告", f"默认模型文件不存在: {path}\n请先在「训练」选项卡中训练对应模型。")
+                return
         try:
-            new_net = Net()
-            load_model(new_net, path)
+            state_dict = torch.load(path, map_location="cpu")
+            model_type = detect_model_type(state_dict)
+            new_net = create_model(model_type)
+            new_net.load_state_dict(state_dict)
             self.net = new_net
+            self.model_type = model_type
             self.model_path = path
             self.model_loaded = True
+            self.model_type_var.set("CNN (卷积网络)" if model_type == "CNN" else "FNN (全连接网络)")
             self._update_model_status()
-            messagebox.showinfo("成功", f"模型已从 {path} 加载")
+            messagebox.showinfo("成功", f"已加载 {model_type} 模型:\n{path}")
         except Exception as e:
             messagebox.showerror("错误", f"加载失败: {e}")
 
